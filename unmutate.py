@@ -1,3 +1,4 @@
+from __future__ import annotations
 import os
 HEADLESS = "IDA_IS_INTERACTIVE" not in os.environ or os.environ["IDA_IS_INTERACTIVE"] != "1"
 
@@ -10,7 +11,7 @@ from keystone import Ks, KS_ARCH_X86, KS_MODE_64 # pip install keystone-engine
 import ctypes
 
 # SETTINGS
-DEOBF_START = 0x7FF6E6A75D20
+DEOBF_START = 0x7FF66269002F
 DO_PATCH = 1
 
 # marker just to indicate to myself that there can be more checks
@@ -24,13 +25,13 @@ def get_frame(addr) -> list[ida_ua.insn_t]:
     result = []
     while True:
         cur_insn = ida_ua.insn_t()
-        idc.create_insn(addr)
+        # idc.create_insn(addr) # UNCOMMENT IF THERES ISSUES
         insn_len = ida_ua.decode_insn(cur_insn, addr)
         assert insn_len != 0, f"Failed to decode instruction @ {addr:#x}"
         result.append(cur_insn)
 
         mnem = cur_insn.get_canon_mnem()
-        if mnem == "retn" or mnem == "jmp":
+        if mnem == "retn" or mnem == "jmp" or (mnem == "int" and cur_insn.Op1.value == 0x3):
             return result
         
         addr += insn_len
@@ -290,7 +291,10 @@ def mov_handler1(cur_frame: list[ida_ua.insn_t]) -> None | tuple:
     reg_width = 8 if mutated_len > 2 else 4
 
     if reg_width == 4:
-        print(f"Had to compress mov instruction @ {i0.ea:#x}, check if you can manually fix")
+        # print(f"Had to compress mov instruction @ {i0.ea:#x}, check if you can manually fix")
+        b = ida_bytes.get_bytes(i0.ip, i0.size + i1.size)
+        print(f"Ignoring short mov instruction @ {i0.ea:#x} ({b!r})")
+        return ida_bytes.get_bytes(i0.ip, i0.size + i1.size), 2, ()
 
     src = ida_idp.get_reg_name(i0.Op1.reg, reg_width)
     dst = ida_idp.get_reg_name(i1.Op1.reg, reg_width)
@@ -757,6 +761,7 @@ analyzed_ranges = []
 def analyze_call(ea):
     global func_list, tainted
     FUNC_START = ea
+    has_mutations = False
 
     to_analyze = [FUNC_START]
     while to_analyze:
@@ -768,7 +773,7 @@ def analyze_call(ea):
         frame = get_frame(cur)
 
         start_ea = cur
-        end_ea = 0 # dynamically keep track of end_ea so that it ends up ending on a real insn and not nop
+        end_ea = start_ea # dynamically keep track of end_ea so that it ends up ending on a real insn and not nop
 
         while frame:
             result = unmutator.find_mutation(frame)
@@ -784,7 +789,7 @@ def analyze_call(ea):
                 end_ea = insn.ea + insn.size
             else:
                 unmutated, to_pop, new_addrs = result
-                print(f"Found mutated insn @ {frame[0].ea:#x} | {unmutated} {to_pop}")
+                # print(f"Found mutated insn @ {frame[0].ea:#x} | {unmutated} {to_pop}")
                 
                 mutated_len = 0
                 for insn in frame[:to_pop]:
@@ -798,39 +803,11 @@ def analyze_call(ea):
                 end_ea = frame[0].ea + len(unmutated)
                 frame = frame[to_pop:]
                 to_analyze.extend(new_addrs)
+                has_mutations = True
         
         analyzed_ranges.append((start_ea, end_ea))
-
-        # assert end_ea != 0
-        # if FUNC_START != start_ea: ida_funcs.append_func_tail(FUNC_START, start_ea, end_ea)
-
-func_list = [DEOBF_START]
-while func_list:
-    ea = func_list.pop(0)
-    # ida_funcs.add_func(ea)
-    analyze_call(ea)
-
-# undef everything because ida is stupid sometimes so we have to do this
-# to get the patched instructions reanalyzed properly
-for start_ea, end_ea in analyzed_ranges:
-    for ea in range(start_ea, end_ea):
-        # delete all code, function tails, and undef any previous func it may be part of
-        ida_bytes.del_items(ea)
-        while ida_funcs.remove_func_tail(ea, ea):
-            pass
-
-        fn = ida_funcs.get_func(ea)
-        if fn and fn.start_ea != DEOBF_START:
-            ida_funcs.del_func(fn.start_ea)
-
-############################################
-############################################
-# reanalyze everything
-############################################
-############################################
-
-tainted = set()
-func_list = [DEOBF_START]
+        
+    return has_mutations
 
 def fix_funcs(func_ea):
     global tainted, func_list
@@ -845,6 +822,10 @@ def fix_funcs(func_ea):
         frame = get_frame(cur_ea)
         for insn in frame:
             mnem = insn.get_canon_mnem()
+
+            # get_frame() doesnt create_insn anymore, so have to do it here
+            idc.create_insn(insn.ip)
+            
             if mnem in jumps_mnem and \
                 insn.Op1.type == ida_ua.o_near:
                 to_analyze.append(insn.Op1.addr)
@@ -864,12 +845,46 @@ def fix_funcs(func_ea):
         if cur_ea != func_ea:
             ida_funcs.append_func_tail(func_ea, cur_ea, frame[-1].ea + frame[-1].size)
 
+def main():
+    global tainted, func_list
+    func_list = [DEOBF_START]
+    while func_list:
+        ea = func_list.pop(0)
+        # ida_funcs.add_func(ea)
+        if analyze_call(ea):
+            print(f"func @ {ea:#x} has mutations")
 
+    # undef everything because ida is stupid sometimes so we have to do this
+    # to get the patched instructions reanalyzed properly
+    for start_ea, end_ea in analyzed_ranges:
+        for ea in range(start_ea, end_ea):
+            # delete all code, function tails, and undef any previous func it may be part of
+            ida_bytes.del_items(ea)
+            while ida_funcs.remove_func_tail(ea, ea):
+                pass
 
-while func_list:
-    ea = func_list.pop(0)
-    ida_funcs.add_func(ea)
-    fix_funcs(ea)
+            fn = ida_funcs.get_func(ea)
+            if fn and fn.start_ea != DEOBF_START:
+                ida_funcs.del_func(fn.start_ea)
+    
+    if not DO_PATCH:
+        return
+    
+    print("Finished initial analysis, reanalyzing to fix up idb...")
 
+    ############################################
+    ############################################
+    # reanalyze everything
+    ############################################
+    ############################################
 
+    tainted = set()
+    func_list = [DEOBF_START]
+
+    while func_list:
+        ea = func_list.pop(0)
+        ida_funcs.add_func(ea)
+        fix_funcs(ea)
+
+main()
 print("Done!")
