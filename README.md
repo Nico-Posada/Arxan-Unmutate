@@ -10,6 +10,5 @@ I probably missed a few mutations, if there's any you find that this script does
 - I use a fair amount of typing utility here which may not be compatible on older versions of Python. I'll probably remove all that later on since a lot of people are too lazy to update python versions (3.13 is out guys)
 
 # TODO
-- Break out of script gracefully after initial analysis if DO_PATCH is disabled
-- Account for weird edge cases like interrupts
 - Maybe add setting to allow users to trust IDA if it says a function is no-return (edge case)
+- Minimal GUI to set start address and other settings
